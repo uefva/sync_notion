@@ -12,6 +12,7 @@ Notion → 本地 Markdown 同步脚本
 
 import os
 import json
+import re
 import sys
 import time
 import argparse
@@ -85,6 +86,8 @@ LAST_REQUEST_AT = 0.0
 VISITED_LOCK = threading.Lock()
 PATH_LOCK = threading.Lock()
 RESERVED_PATHS = set()
+REMOTE_OBJECT_LOCK = threading.Lock()
+REMOTE_OBJECT_AVAILABLE = {}
 
 LAYOUT_CONTAINER_BLOCKS = {
     "column_list",
@@ -355,7 +358,12 @@ def rich_text_to_md(rich_text):
 
 def rich_text_to_plain_text(rich_text):
     """将 rich_text 数组转换为纯文本，用于标题和文件名。"""
-    return "".join(rt.get("plain_text", "") for rt in rich_text)
+    return normalize_text_whitespace("".join(rt.get("plain_text", "") for rt in rich_text))
+
+
+def normalize_text_whitespace(text):
+    """Collapse Notion title whitespace so Markdown links and file paths stay single-line."""
+    return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
 def notion_color_to_md(color):
@@ -494,6 +502,7 @@ def block_to_md(block, indent=0, output_dir=None, page_id="", current_dir=None):
 def sanitize_filename(name):
     """清理非法文件名字符"""
     invalid_chars = '<>:"/\\|?*'
+    name = normalize_text_whitespace(name)
     result = "".join(c if c not in invalid_chars else "_" for c in name)
     result = result.strip(". ")
     return result or "untitled"
@@ -561,7 +570,28 @@ def file_exists_for_entry(entry):
     return bool(file_path and Path(file_path).exists())
 
 
-def can_reuse_entry(entry, old_items, force_rewrite_ids):
+def remote_object_available(entry):
+    """Check that an unchanged page/database still exists and is not in trash."""
+    obj_type = entry.get("object_type")
+    obj_id = entry.get("id")
+    if not obj_id or obj_type not in ("page", "database"):
+        return True
+
+    cache_key = (obj_type, obj_id)
+    with REMOTE_OBJECT_LOCK:
+        if cache_key in REMOTE_OBJECT_AVAILABLE:
+            return REMOTE_OBJECT_AVAILABLE[cache_key]
+
+    path = f"databases/{obj_id}" if obj_type == "database" else f"pages/{obj_id}"
+    obj = notion_get(path)
+    available = bool(obj and not is_notion_trashed(obj))
+
+    with REMOTE_OBJECT_LOCK:
+        REMOTE_OBJECT_AVAILABLE[cache_key] = available
+    return available
+
+
+def can_reuse_entry(entry, old_items, force_rewrite_ids, verify_remote=False):
     """判断本次是否可以复用旧 Markdown，不重新拉取 block 内容。"""
     old_entry = (old_items or {}).get(entry["id"])
     if not old_entry or entry["id"] in force_rewrite_ids:
@@ -573,7 +603,11 @@ def can_reuse_entry(entry, old_items, force_rewrite_ids):
         return False
     if Path(old_file).resolve() != Path(entry["file"]).resolve():
         return False
-    return Path(old_file).exists()
+    if not Path(old_file).exists():
+        return False
+    if verify_remote and not remote_object_available(entry):
+        return False
+    return True
 
 
 def object_parent_info(obj):
@@ -665,6 +699,7 @@ def build_path_plan(output_dir, search_items):
     planned = {}
     resolving = set()
     missing_parent_cache = set()
+    trashed_parent_ids = set()
 
     def load_missing_parent(parent_type, parent_id):
         if not parent_id or parent_id in item_map:
@@ -678,7 +713,10 @@ def build_path_plan(output_dir, search_items):
 
         path = f"pages/{parent_id}" if parent_type == "page_id" else f"databases/{parent_id}"
         parent_obj = notion_get(path)
-        if not parent_obj or is_notion_trashed(parent_obj):
+        if parent_obj and is_notion_trashed(parent_obj):
+            trashed_parent_ids.add(parent_id)
+            return
+        if not parent_obj:
             return
         item_map[parent_id] = search_item_info(parent_obj, block_parent_cache, from_search=False)
 
@@ -698,6 +736,9 @@ def build_path_plan(output_dir, search_items):
         object_type = info.get("object_type")
 
         load_missing_parent(parent_type, parent_id)
+        if parent_id in trashed_parent_ids:
+            resolving.remove(obj_id)
+            return None
 
         if object_type == "database":
             safe_title = truncate_filename(sanitize_filename(title), 60)
@@ -1028,7 +1069,7 @@ def render_block(block, output_dir, page_id, current_dir, indent=0, visited=None
 
     if block_type == "child_page":
         child_id = block["id"]
-        title = b_data.get("title", "untitled")
+        title = normalize_text_whitespace(b_data.get("title", "untitled")) or "untitled"
         relayout_planned_child(child_id, title, "page", page_id, "page_id", output_dir, planned, child_parent_dir)
         child_result = sync_page(child_id, output_dir, visited, old_items, planned, force_rewrite_ids, depth + 1)
         if collected is not None:
@@ -1046,7 +1087,7 @@ def render_block(block, output_dir, page_id, current_dir, indent=0, visited=None
 
     if block_type == "child_database":
         db_id = block["id"]
-        title = b_data.get("title", "untitled")
+        title = normalize_text_whitespace(b_data.get("title", "untitled")) or "untitled"
         relayout_planned_child(db_id, title, "database", page_id, "page_id", output_dir, planned, child_parent_dir)
         db_result = sync_database(db_id, output_dir, visited, old_items, planned, force_rewrite_ids, depth + 1)
         if collected is not None:
@@ -1102,7 +1143,7 @@ def sync_page(page_id, output_dir, visited=None, old_items=None, planned=None, f
     if not entry:
         entry = planned_child_entry(page_id, "Untitled", "page", None, None, output_dir, planned, output_dir / "_orphans")
 
-    if can_reuse_entry(entry, old_items, force_rewrite_ids):
+    if can_reuse_entry(entry, old_items, force_rewrite_ids, verify_remote=True):
         print(f"{'  ' * depth}⏭️  {entry['title']}（未修改）")
         return {page_id: entry}
 
@@ -1191,7 +1232,7 @@ def sync_database_row(row, db_title, db_dir, output_dir, visited=None, old_items
     filepath = Path(entry["file"])
     child_dir = filepath.with_suffix("")
 
-    if can_reuse_entry(entry, old_items, force_rewrite_ids):
+    if can_reuse_entry(entry, old_items, force_rewrite_ids, verify_remote=True):
         print(f"{indent}  ⏭️  {entry['title']}（未修改）")
         return {row_id: entry}
 
@@ -1435,6 +1476,49 @@ def is_nested_search_item(item, search_ids):
     return bool(parent_id and parent_id in search_ids)
 
 
+def build_current_items(planned, all_results, old_items, force_rewrite_ids):
+    """Build the manifest/index set, excluding trashed objects and children of skipped parents."""
+    current_items = {}
+    resolving = set()
+
+    def include_entry(obj_id):
+        if obj_id in current_items:
+            return True
+        if obj_id in resolving:
+            return False
+
+        entry = planned.get(obj_id)
+        if not entry:
+            return False
+
+        resolving.add(obj_id)
+        parent_type = entry.get("parent_type")
+        parent_id = entry.get("parent_id")
+        if parent_type in ("page_id", "database_id") and parent_id in planned:
+            if not include_entry(parent_id):
+                resolving.remove(obj_id)
+                return False
+
+        is_current = (
+            obj_id in all_results
+            or (
+                not entry.get("from_search", True)
+                and remote_object_available(entry)
+            )
+            or can_reuse_entry(entry, old_items, force_rewrite_ids, verify_remote=True)
+        )
+        if is_current:
+            current_items[obj_id] = entry
+
+        resolving.remove(obj_id)
+        return is_current
+
+    for obj_id in planned:
+        include_entry(obj_id)
+
+    return current_items
+
+
 def get_index_page(output_dir, all_pages):
     """生成索引页 index.md"""
     md_lines = ["# Notion 同步索引\n\n"]
@@ -1555,11 +1639,7 @@ def main():
             except Exception as e:
                 print(f"  ⚠️ 同步任务失败: {e}")
 
-    current_items = {
-        obj_id: entry
-        for obj_id, entry in planned.items()
-        if obj_id in all_results or can_reuse_entry(entry, old_items, force_rewrite_ids)
-    }
+    current_items = build_current_items(planned, all_results, old_items, force_rewrite_ids)
     archive_stale_entries(output_dir, old_items, current_items)
     save_sync_manifest(output_dir, current_items)
 
