@@ -576,13 +576,68 @@ def can_reuse_entry(entry, old_items, force_rewrite_ids):
     return Path(old_file).exists()
 
 
-def search_item_info(item):
+def object_parent_info(obj):
+    """Return (parent_type, parent_id) from a Notion object."""
+    parent = obj.get("parent") or {}
+    parent_type = parent.get("type")
+    if not parent_type:
+        return None, None
+    return parent_type, parent.get(parent_type)
+
+
+def resolve_block_parent(block_id, block_parent_cache):
+    """Resolve a block parent chain to the nearest page/database/workspace parent."""
+    current_id = block_id
+    seen = []
+
+    while current_id:
+        if current_id in block_parent_cache:
+            resolved = block_parent_cache[current_id]
+            for seen_id in seen:
+                block_parent_cache[seen_id] = resolved
+            return resolved
+
+        if current_id in seen:
+            resolved = (None, None)
+            break
+
+        seen.append(current_id)
+        block = notion_get(f"blocks/{current_id}")
+        if not block:
+            resolved = (None, None)
+            break
+
+        parent_type, parent_id = object_parent_info(block)
+        if parent_type == "block_id" and parent_id:
+            current_id = parent_id
+            continue
+
+        resolved = (parent_type, parent_id)
+        break
+    else:
+        resolved = (None, None)
+
+    for seen_id in seen:
+        block_parent_cache[seen_id] = resolved
+    return resolved
+
+
+def search_item_info(item, block_parent_cache=None, from_search=True):
     """把 Notion search 结果规范化为路径规划所需的元数据。"""
+    if block_parent_cache is None:
+        block_parent_cache = {}
+
     obj_id = item["id"]
     obj_type = item.get("object", "")
-    parent = item.get("parent") or {}
-    parent_type = parent.get("type")
-    parent_id = parent.get(parent_type) if parent_type else None
+    raw_parent_type, raw_parent_id = object_parent_info(item)
+    parent_type = raw_parent_type
+    parent_id = raw_parent_id
+
+    if parent_type == "block_id" and parent_id:
+        resolved_type, resolved_id = resolve_block_parent(parent_id, block_parent_cache)
+        if resolved_type in ("page_id", "database_id", "workspace"):
+            parent_type = resolved_type
+            parent_id = resolved_id
     title = get_database_title(item) if obj_type == "database" else get_page_title(item)
     return {
         "id": obj_id,
@@ -590,6 +645,9 @@ def search_item_info(item):
         "title": title,
         "parent_id": parent_id,
         "parent_type": parent_type,
+        "raw_parent_id": raw_parent_id,
+        "raw_parent_type": raw_parent_type,
+        "from_search": from_search,
         "last_edited": item.get("last_edited_time", ""),
         "url": item.get("url", ""),
     }
@@ -599,12 +657,30 @@ def build_path_plan(output_dir, search_items):
     """基于当前 Notion 可见对象全集，计算本次同步的目标路径。"""
     RESERVED_PATHS.clear()
     now = datetime.now().isoformat(timespec="seconds")
+    block_parent_cache = {}
     item_map = {
-        item["id"]: search_item_info(item)
+        item["id"]: search_item_info(item, block_parent_cache)
         for item in search_items
     }
     planned = {}
     resolving = set()
+    missing_parent_cache = set()
+
+    def load_missing_parent(parent_type, parent_id):
+        if not parent_id or parent_id in item_map:
+            return
+        if parent_type not in ("page_id", "database_id"):
+            return
+        cache_key = (parent_type, parent_id)
+        if cache_key in missing_parent_cache:
+            return
+        missing_parent_cache.add(cache_key)
+
+        path = f"pages/{parent_id}" if parent_type == "page_id" else f"databases/{parent_id}"
+        parent_obj = notion_get(path)
+        if not parent_obj or is_notion_trashed(parent_obj):
+            return
+        item_map[parent_id] = search_item_info(parent_obj, block_parent_cache, from_search=False)
 
     def planned_entry(obj_id):
         if obj_id in planned:
@@ -620,6 +696,8 @@ def build_path_plan(output_dir, search_items):
         parent_id = info.get("parent_id")
         parent_type = info.get("parent_type")
         object_type = info.get("object_type")
+
+        load_missing_parent(parent_type, parent_id)
 
         if object_type == "database":
             safe_title = truncate_filename(sanitize_filename(title), 60)
@@ -657,6 +735,9 @@ def build_path_plan(output_dir, search_items):
             "title": title,
             "parent_id": parent_id,
             "parent_type": parent_type,
+            "raw_parent_id": info.get("raw_parent_id"),
+            "raw_parent_type": info.get("raw_parent_type"),
+            "from_search": info.get("from_search", True),
             "last_edited": info.get("last_edited", ""),
             "file": str(target_path.resolve()),
             "path": rel_path,
@@ -1296,6 +1377,44 @@ def sync_search_item(item, output_dir, visited, old_items=None, planned=None, fo
     return {}
 
 
+def should_sync_planned_entry(entry, planned, planned_databases):
+    """Return True when this planned object must be an explicit sync entry."""
+    obj_type = entry.get("object_type")
+    parent_type = entry.get("parent_type")
+    parent_id = entry.get("parent_id")
+    parent_entry = planned.get(parent_id)
+
+    if obj_type == "database":
+        return entry.get("from_search", True)
+    if parent_type == "page_id":
+        if parent_entry and not parent_entry.get("from_search", True):
+            return True
+        return parent_id not in planned
+    if parent_type == "database_id":
+        if parent_entry and not parent_entry.get("from_search", True):
+            return True
+        return parent_id not in planned_databases
+    return True
+
+
+def sync_planned_entry(entry, output_dir, visited, old_items=None, planned=None, force_rewrite_ids=None):
+    """Sync a planned object without relying on raw search parent metadata."""
+    obj_type = entry.get("object_type", "")
+    obj_id = entry["id"]
+
+    if obj_type == "page":
+        return sync_page(obj_id, output_dir, visited, old_items, planned, force_rewrite_ids)
+
+    if obj_type == "database":
+        result = sync_database(obj_id, output_dir, visited, old_items, planned, force_rewrite_ids)
+        with VISITED_LOCK:
+            for rid in result:
+                visited.add(rid)
+        return result
+
+    return {}
+
+
 def search_item_parent_id(item):
     """从 Notion search 结果中提取父对象 ID。"""
     parent = item.get("parent") or {}
@@ -1415,17 +1534,8 @@ def main():
         if entry.get("object_type") == "database"
     }
     sync_items = [
-        item for item in all_pages_data
-        if item.get("object") == "database"
-        or (
-            item.get("parent", {}).get("type") == "page_id"
-            and search_item_parent_id(item) not in planned
-        )
-        or (
-            item.get("parent", {}).get("type") == "database_id"
-            and search_item_parent_id(item) not in planned_databases
-        )
-        or item.get("parent", {}).get("type") not in ("page_id", "database_id")
+        entry for entry in planned.values()
+        if should_sync_planned_entry(entry, planned, planned_databases)
     ]
 
     print(f"🌳 本次调度: {len(sync_items)} 个入口对象")
@@ -1433,7 +1543,7 @@ def main():
     workers = max(1, min(MAX_WORKERS, len(sync_items) or 1))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [
-            executor.submit(sync_search_item, item, output_dir, visited, old_items, planned, force_rewrite_ids)
+            executor.submit(sync_planned_entry, item, output_dir, visited, old_items, planned, force_rewrite_ids)
             for item in sync_items
         ]
         for future in as_completed(futures):
