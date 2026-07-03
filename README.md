@@ -8,7 +8,10 @@
 - 同步 Notion Database 条目为独立 Markdown 文件
 - 支持递归导出子页面、嵌套块、Toggle、表格、代码块、引用、待办、图片等常见内容
 - 支持图片下载到本地 `images/` 目录
-- 支持增量同步，未修改页面会自动跳过
+- 使用 `.sync_manifest.json` 做镜像式增量同步，未变化页面会复用本地 Markdown
+- 每次运行都会刷新 `index.md` 为最新镜像索引
+- 自动跳过 Notion 已归档或回收站中的页面、数据库和数据库条目
+- 旧清单中存在但本次 Notion 不再出现的内容会移动到 `_stale/`，不会直接删除
 - 支持并发同步，可通过 `--workers` 调整速度
 - 自动生成 `index.md` 索引文件
 - 遇到无权限、已删除或 API 不支持的对象时跳过，不中断整体同步
@@ -129,17 +132,23 @@ python sync_notion.py --help
 ```text
 notion_sync/
 ├── index.md
-├── .sync_state.json
+├── .sync_manifest.json
 ├── images/
 ├── pages/
-└── databases/
+├── databases/
+├── _orphans/
+└── _stale/
 ```
 
 - `index.md`：本次同步的页面索引
-- `.sync_state.json`：增量同步状态文件
+- `.sync_manifest.json`：镜像式增量同步清单，用于判断哪些页面可以复用
 - `images/`：下载到本地的图片
 - `pages/`：普通页面导出的 Markdown
 - `databases/`：数据库条目导出的 Markdown
+- `_orphans/`：父级无法通过 API 递归定位时的兜底输出目录
+- `_stale/`：旧清单中存在但本次不再同步到的 Markdown 文件或数据库目录归档
+
+脚本不会主动清空 `output_dir`，避免误删其他文件。`index.md` 只记录本次最新同步到的页面；旧清单管理过但本次没有同步到的文件会移动到 `_stale/`。不在 `.sync_manifest.json` 里的手写文件不会被移动或删除。
 
 ## 定时同步
 

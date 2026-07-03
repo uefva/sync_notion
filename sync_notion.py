@@ -7,14 +7,16 @@ Notion → 本地 Markdown 同步脚本
   2. 复制 conf/config.example.json 为 conf/config.json，并填入 Notion Token
   3. python sync_notion.py
 
-第一次运行会全量拉取，之后会跳过未修改的页面。
+每次运行都会重新拉取当前可同步内容，并刷新 index.md 为本次同步索引。
 """
 
 import os
 import json
+import sys
 import time
 import argparse
 import threading
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
@@ -25,6 +27,11 @@ try:
 except ImportError:
     print("请先安装 requests: pip install requests")
     exit(1)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
 
 # ============================================================
 # ★ 配置区域 ★
@@ -54,8 +61,9 @@ DOWNLOAD_IMAGES = True
 # Notion API 版本
 NOTION_VERSION = "2022-06-28"
 
-# 同步状态文件，用来跳过未修改页面
-MANIFEST_NAME = ".sync_state.json"
+# 本地镜像清单，用于增量同步和过期文件归档
+MANIFEST_NAME = ".sync_manifest.json"
+MANIFEST_VERSION = 1
 
 # ============================================================
 # Notion API 封装
@@ -72,6 +80,18 @@ BASE = "https://api.notion.com/v1"
 RATE_LOCK = threading.Lock()
 LAST_REQUEST_AT = 0.0
 VISITED_LOCK = threading.Lock()
+PATH_LOCK = threading.Lock()
+RESERVED_PATHS = set()
+
+LAYOUT_CONTAINER_BLOCKS = {
+    "column_list",
+    "column",
+    "breadcrumb",
+    "table_of_contents",
+    "synced_block",
+    "template",
+    "link_preview",
+}
 
 
 def update_headers():
@@ -116,6 +136,11 @@ def error_detail(resp):
         return data.get("message") or resp.text[:200]
     except Exception:
         return resp.text[:200]
+
+
+def is_notion_trashed(obj):
+    """判断 Notion 对象是否已归档或在回收站中。"""
+    return bool(obj.get("archived") or obj.get("in_trash"))
 
 
 def notion_get(path, params=None):
@@ -305,6 +330,11 @@ def rich_text_to_md(rich_text):
     return "".join(parts)
 
 
+def rich_text_to_plain_text(rich_text):
+    """将 rich_text 数组转换为纯文本，用于标题和文件名。"""
+    return "".join(rt.get("plain_text", "") for rt in rich_text)
+
+
 def notion_color_to_md(color):
     """Notion 颜色 → 没有直接 Markdown 对应，记录提示"""
     if color and color != "default":
@@ -446,6 +476,359 @@ def sanitize_filename(name):
     return result or "untitled"
 
 
+def truncate_filename(name, max_length):
+    """按文件名长度截断，同时保留至少一个可用字符。"""
+    return (name[:max_length]).strip(". ") or "untitled"
+
+
+def reserve_unique_path(base_path, entity_id=None, manifest=None):
+    """保留本次运行中的唯一路径；重名时追加编号。"""
+    base_path = Path(base_path)
+
+    with PATH_LOCK:
+        index = 1
+        while True:
+            if index == 1:
+                candidate = base_path
+            else:
+                candidate = base_path.with_name(f"{base_path.stem} ({index}){base_path.suffix}")
+
+            resolved = str(candidate.resolve())
+            if resolved not in RESERVED_PATHS:
+                RESERVED_PATHS.add(resolved)
+                return candidate
+
+            index += 1
+
+
+def load_sync_manifest(output_dir):
+    """读取上一次镜像同步清单。"""
+    manifest_path = output_dir / MANIFEST_NAME
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"  ⚠️ 同步清单读取失败，将执行较完整同步: {e}")
+        return {}
+
+    if isinstance(data, dict) and isinstance(data.get("items"), dict):
+        return data["items"]
+    if isinstance(data, dict):
+        return data
+    return {}
+
+
+def save_sync_manifest(output_dir, items):
+    """保存本次镜像同步清单。"""
+    manifest_path = output_dir / MANIFEST_NAME
+    payload = {
+        "version": MANIFEST_VERSION,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "items": items,
+    }
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def file_exists_for_entry(entry):
+    """判断 manifest 条目对应的文件或目录是否仍在本地。"""
+    file_path = entry.get("file")
+    return bool(file_path and Path(file_path).exists())
+
+
+def can_reuse_entry(entry, old_items, force_rewrite_ids):
+    """判断本次是否可以复用旧 Markdown，不重新拉取 block 内容。"""
+    old_entry = (old_items or {}).get(entry["id"])
+    if not old_entry or entry["id"] in force_rewrite_ids:
+        return False
+    if old_entry.get("last_edited") != entry.get("last_edited"):
+        return False
+    old_file = old_entry.get("file")
+    if not old_file:
+        return False
+    if Path(old_file).resolve() != Path(entry["file"]).resolve():
+        return False
+    return Path(old_file).exists()
+
+
+def search_item_info(item):
+    """把 Notion search 结果规范化为路径规划所需的元数据。"""
+    obj_id = item["id"]
+    obj_type = item.get("object", "")
+    parent = item.get("parent") or {}
+    parent_type = parent.get("type")
+    parent_id = parent.get(parent_type) if parent_type else None
+    title = get_database_title(item) if obj_type == "database" else get_page_title(item)
+    return {
+        "id": obj_id,
+        "object_type": obj_type,
+        "title": title,
+        "parent_id": parent_id,
+        "parent_type": parent_type,
+        "last_edited": item.get("last_edited_time", ""),
+        "url": item.get("url", ""),
+    }
+
+
+def build_path_plan(output_dir, search_items):
+    """基于当前 Notion 可见对象全集，计算本次同步的目标路径。"""
+    RESERVED_PATHS.clear()
+    now = datetime.now().isoformat(timespec="seconds")
+    item_map = {
+        item["id"]: search_item_info(item)
+        for item in search_items
+    }
+    planned = {}
+    resolving = set()
+
+    def planned_entry(obj_id):
+        if obj_id in planned:
+            return planned[obj_id]
+        info = item_map.get(obj_id)
+        if not info:
+            return None
+        if obj_id in resolving:
+            return None
+
+        resolving.add(obj_id)
+        title = info["title"]
+        parent_id = info.get("parent_id")
+        parent_type = info.get("parent_type")
+        object_type = info.get("object_type")
+
+        if object_type == "database":
+            safe_title = truncate_filename(sanitize_filename(title), 60)
+            if parent_type == "page_id" and parent_id in item_map:
+                parent_entry = planned_entry(parent_id)
+                parent_dir = Path(parent_entry["file"]).with_suffix("") if parent_entry else output_dir / "_orphans"
+                base_path = parent_dir / safe_title
+            elif parent_type == "workspace":
+                base_path = output_dir / "databases" / safe_title
+            else:
+                base_path = output_dir / "_orphans" / safe_title
+            target_path = reserve_unique_path(base_path)
+        else:
+            max_length = 50 if parent_type == "database_id" else 60
+            safe_title = truncate_filename(sanitize_filename(title), max_length)
+            if parent_type == "page_id" and parent_id in item_map:
+                parent_entry = planned_entry(parent_id)
+                parent_dir = Path(parent_entry["file"]).with_suffix("") if parent_entry else output_dir / "_orphans"
+                base_path = parent_dir / f"{safe_title}.md"
+            elif parent_type == "database_id" and parent_id in item_map:
+                parent_entry = planned_entry(parent_id)
+                parent_dir = Path(parent_entry["file"]) if parent_entry else output_dir / "_orphans"
+                base_path = parent_dir / f"{safe_title}.md"
+            elif parent_type == "workspace":
+                base_path = output_dir / "pages" / f"{safe_title}.md"
+            else:
+                base_path = output_dir / "_orphans" / f"{safe_title}.md"
+            target_path = reserve_unique_path(base_path)
+
+        resolving.remove(obj_id)
+        rel_path = markdown_path(os.path.relpath(str(target_path), str(output_dir)))
+        entry = {
+            "id": obj_id,
+            "object_type": object_type,
+            "title": title,
+            "parent_id": parent_id,
+            "parent_type": parent_type,
+            "last_edited": info.get("last_edited", ""),
+            "file": str(target_path.resolve()),
+            "path": rel_path,
+            "url": info.get("url", ""),
+            "seen_at": now,
+        }
+        planned[obj_id] = entry
+        return entry
+
+    for obj_id in sorted(item_map):
+        planned_entry(obj_id)
+
+    return planned
+
+
+def planned_child_entry(obj_id, title, object_type, parent_id, parent_type, output_dir, planned, parent_dir):
+    """为 search 未返回但递归发现的子对象创建兜底路径规划。"""
+    if obj_id in planned:
+        return planned[obj_id]
+
+    now = datetime.now().isoformat(timespec="seconds")
+    if object_type == "database":
+        safe_title = truncate_filename(sanitize_filename(title), 60)
+        target_path = reserve_unique_path(Path(parent_dir) / safe_title)
+    else:
+        max_length = 50 if parent_type == "database_id" else 60
+        safe_title = truncate_filename(sanitize_filename(title), max_length)
+        target_path = reserve_unique_path(Path(parent_dir) / f"{safe_title}.md")
+
+    entry = {
+        "id": obj_id,
+        "object_type": object_type,
+        "title": title,
+        "parent_id": parent_id,
+        "parent_type": parent_type,
+        "last_edited": "",
+        "file": str(target_path.resolve()),
+        "path": markdown_path(os.path.relpath(str(target_path), str(output_dir))),
+        "url": "",
+        "seen_at": now,
+    }
+    planned[obj_id] = entry
+    return entry
+
+
+def relayout_planned_child(obj_id, title, object_type, parent_id, parent_type, output_dir, planned, parent_dir):
+    """用递归上下文修正 search 阶段无法定位的子对象路径。"""
+    entry = planned.get(obj_id)
+    if entry and "_orphans/" not in entry.get("path", ""):
+        return entry
+
+    if entry:
+        old_file = entry.get("file")
+        if old_file:
+            RESERVED_PATHS.discard(str(Path(old_file).resolve()))
+    else:
+        entry = {}
+
+    now = datetime.now().isoformat(timespec="seconds")
+    if object_type == "database":
+        safe_title = truncate_filename(sanitize_filename(entry.get("title") or title), 60)
+        target_path = reserve_unique_path(Path(parent_dir) / safe_title)
+    else:
+        max_length = 50 if parent_type == "database_id" else 60
+        safe_title = truncate_filename(sanitize_filename(entry.get("title") or title), max_length)
+        target_path = reserve_unique_path(Path(parent_dir) / f"{safe_title}.md")
+
+    entry.update({
+        "id": obj_id,
+        "object_type": object_type,
+        "title": entry.get("title") or title,
+        "parent_id": parent_id,
+        "parent_type": parent_type,
+        "file": str(target_path.resolve()),
+        "path": markdown_path(os.path.relpath(str(target_path), str(output_dir))),
+        "seen_at": now,
+    })
+    planned[obj_id] = entry
+    return entry
+
+
+def changed_or_moved_ids(planned, old_items):
+    """找出需要重写的对象，以及因子节点变动需刷新链接的祖先页面。"""
+    changed = set()
+    for obj_id, entry in planned.items():
+        old_entry = (old_items or {}).get(obj_id)
+        if not old_entry:
+            changed.add(obj_id)
+            continue
+        if old_entry.get("last_edited") != entry.get("last_edited"):
+            changed.add(obj_id)
+            continue
+        old_file = old_entry.get("file")
+        if not old_file or Path(old_file).resolve() != Path(entry["file"]).resolve():
+            changed.add(obj_id)
+            continue
+        if not file_exists_for_entry(old_entry):
+            changed.add(obj_id)
+
+    force = set(changed)
+    for obj_id in list(changed):
+        parent_id = planned.get(obj_id, {}).get("parent_id")
+        while parent_id and parent_id in planned:
+            force.add(parent_id)
+            parent_id = planned[parent_id].get("parent_id")
+    return force
+
+
+def unique_stale_destination(dest):
+    """避免 _stale 归档路径撞名。"""
+    dest = Path(dest)
+    if not dest.exists():
+        return dest
+    index = 2
+    while True:
+        candidate = dest.with_name(f"{dest.stem} ({index}){dest.suffix}")
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def path_is_relative_to(path, parent):
+    """兼容 Python 3.8 的 Path.is_relative_to。"""
+    try:
+        Path(path).resolve().relative_to(Path(parent).resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def archive_stale_entries(output_dir, old_items, current_items):
+    """把旧 manifest 管理但本次不再使用的文件移入 _stale。"""
+    if not old_items:
+        return
+
+    current_paths = {
+        str(Path(entry["file"]).resolve())
+        for entry in current_items.values()
+        if entry.get("file")
+    }
+    candidates = []
+    for obj_id, old_entry in old_items.items():
+        old_file = old_entry.get("file")
+        if not old_file:
+            continue
+        old_path = Path(old_file).resolve()
+        if not old_path.exists():
+            continue
+        current_entry = current_items.get(obj_id)
+        if current_entry and Path(current_entry["file"]).resolve() == old_path:
+            continue
+        if str(old_path) in current_paths:
+            continue
+        candidates.append(old_path)
+
+    if not candidates:
+        return
+
+    managed_paths = {
+        Path(entry["file"]).resolve()
+        for entry in old_items.values()
+        if entry.get("file")
+    }
+    current_path_objs = {Path(path) for path in current_paths}
+
+    def directory_is_fully_managed(path):
+        for child in path.rglob("*"):
+            if child.is_file() and child.resolve() not in managed_paths:
+                return False
+        return True
+
+    stale_root = output_dir / "_stale" / datetime.now().strftime("%Y%m%d-%H%M%S")
+    moved_roots = []
+    for old_path in sorted(set(candidates), key=lambda p: len(p.parts)):
+        if any(old_path == root or path_is_relative_to(old_path, root) for root in moved_roots):
+            continue
+        if any(path_is_relative_to(current_path, old_path) for current_path in current_path_objs):
+            continue
+        if old_path.is_dir() and not directory_is_fully_managed(old_path):
+            continue
+        try:
+            rel_path = old_path.relative_to(output_dir)
+        except ValueError:
+            print(f"  ⚠️ 跳过输出目录外的旧文件: {old_path}")
+            continue
+        dest = unique_stale_destination(stale_root / rel_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.move(str(old_path), str(dest))
+            moved_roots.append(old_path)
+            print(f"  🗄️  过期归档: {old_path} -> {dest}")
+        except Exception as e:
+            print(f"  ⚠️ 过期文件归档失败: {old_path} ({e})")
+
+
 def get_page_title(page):
     """从 page 对象中提取标题"""
     properties = page.get("properties", {})
@@ -456,14 +839,14 @@ def get_page_title(page):
         if prop:
             title_data = prop.get("title", [])
             if title_data:
-                return rich_text_to_md(title_data)
+                return rich_text_to_plain_text(title_data)
 
     # 对于 database item，尝试第一个 title 类型的属性
     for prop_name, prop_data in properties.items():
         if prop_data.get("type") == "title":
             title_list = prop_data.get("title", [])
             if title_list:
-                return rich_text_to_md(title_list)
+                return rich_text_to_plain_text(title_list)
 
     return "Untitled"
 
@@ -472,7 +855,7 @@ def get_database_title(database):
     """从 database 对象中提取标题"""
     title_data = database.get("title", [])
     if title_data:
-        return rich_text_to_md(title_data)
+        return rich_text_to_plain_text(title_data)
     return "Untitled"
 
 
@@ -489,40 +872,6 @@ def markdown_path(path):
 def relative_markdown_link(target, current_dir):
     """生成相对当前 Markdown 文件目录的链接。"""
     return markdown_path(os.path.relpath(str(target), str(current_dir)))
-
-
-def load_manifest(output_dir):
-    """读取上次同步状态。"""
-    manifest_path = output_dir / MANIFEST_NAME
-    try:
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except FileNotFoundError:
-        return {}
-    except Exception as e:
-        print(f"  ⚠️ 同步状态读取失败，将重新同步: {e}")
-        return {}
-
-
-def save_manifest(output_dir, all_pages):
-    """保存本次同步状态。"""
-    manifest_path = output_dir / MANIFEST_NAME
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(all_pages, f, ensure_ascii=False, indent=2)
-
-
-def unchanged_page_info(page_id, last_edited, manifest):
-    """如果页面未变化且本地文件仍存在，返回旧记录。"""
-    info = (manifest or {}).get(page_id)
-    if not info:
-        return None
-    if info.get("last_edited") != last_edited:
-        return None
-    file_path = info.get("file")
-    if not file_path or not Path(file_path).exists():
-        return None
-    return info
 
 
 def escape_table_cell(text):
@@ -553,44 +902,52 @@ def render_table(block, indent=0):
     return "".join(md)
 
 
-def render_blocks(blocks, output_dir, page_id, current_dir, indent=0, visited=None, depth=0, manifest=None, collected=None):
+def render_blocks(blocks, output_dir, page_id, current_dir, indent=0, visited=None, depth=0, old_items=None, planned=None, force_rewrite_ids=None, collected=None, child_parent_dir=None):
     """递归渲染一组 Notion blocks。"""
     md = []
     for block in blocks:
-        md.append(render_block(block, output_dir, page_id, current_dir, indent, visited, depth, manifest, collected))
+        md.append(render_block(block, output_dir, page_id, current_dir, indent, visited, depth, old_items, planned, force_rewrite_ids, collected, child_parent_dir))
     return "".join(md)
 
 
-def render_block(block, output_dir, page_id, current_dir, indent=0, visited=None, depth=0, manifest=None, collected=None):
+def render_block(block, output_dir, page_id, current_dir, indent=0, visited=None, depth=0, old_items=None, planned=None, force_rewrite_ids=None, collected=None, child_parent_dir=None):
     """递归渲染单个 Notion block。"""
     block_type = block.get("type")
     b_data = block.get(block_type, {})
     indent_str = "  " * indent
+    child_parent_dir = child_parent_dir or current_dir
+    planned = planned if planned is not None else {}
+    force_rewrite_ids = force_rewrite_ids or set()
 
     if block_type == "child_page":
         child_id = block["id"]
-        child_result = sync_page(child_id, output_dir, visited, depth + 1, manifest)
+        title = b_data.get("title", "untitled")
+        relayout_planned_child(child_id, title, "page", page_id, "page_id", output_dir, planned, child_parent_dir)
+        child_result = sync_page(child_id, output_dir, visited, old_items, planned, force_rewrite_ids, depth + 1)
         if collected is not None:
             collected.update(child_result)
-        child_info = child_result.get(child_id) or (manifest or {}).get(child_id)
-        title = b_data.get("title", "untitled")
+        child_info = child_result.get(child_id) or planned.get(child_id)
         if child_info:
             title = child_info.get("title", title)
             link = relative_markdown_link(child_info["file"], current_dir)
         else:
             safe_title = sanitize_filename(title)
-            if len(safe_title) > 60:
-                safe_title = safe_title[:60]
-            expected_path = output_dir / "pages" / f"{safe_title}_{child_id[:8]}.md"
+            safe_title = truncate_filename(safe_title, 60)
+            expected_path = child_parent_dir / f"{safe_title}.md"
             link = relative_markdown_link(expected_path, current_dir)
         return f"{indent_str}- [{title}]({link})\n"
 
     if block_type == "child_database":
         db_id = block["id"]
         title = b_data.get("title", "untitled")
-        db_result = sync_database(db_id, output_dir, depth + 1, manifest)
+        relayout_planned_child(db_id, title, "database", page_id, "page_id", output_dir, planned, child_parent_dir)
+        db_result = sync_database(db_id, output_dir, visited, old_items, planned, force_rewrite_ids, depth + 1)
         if collected is not None:
             collected.update(db_result)
+        db_info = db_result.get(db_id) or planned.get(db_id)
+        if db_info:
+            link = relative_markdown_link(db_info["file"], current_dir)
+            return f"{indent_str}- [Database: {title}]({link})\n"
         return f"{indent_str}- Database: {title}\n"
 
     if block_type == "table":
@@ -599,14 +956,15 @@ def render_block(block, output_dir, page_id, current_dir, indent=0, visited=None
     if block_type == "toggle":
         text = rich_text_to_md(b_data.get("rich_text", []))
         children = get_block_children(block["id"]) if block.get("has_children") else []
-        inner = render_blocks(children, output_dir, page_id, current_dir, indent + 1, visited, depth, manifest, collected)
+        inner = render_blocks(children, output_dir, page_id, current_dir, indent + 1, visited, depth, old_items, planned, force_rewrite_ids, collected, child_parent_dir)
         return f"{indent_str}<details>\n{indent_str}<summary>{text}</summary>\n\n{inner}{indent_str}</details>\n\n"
 
     md = block_to_md(block, indent=indent, output_dir=output_dir, page_id=page_id, current_dir=current_dir)
 
     if block.get("has_children"):
         children = get_block_children(block["id"])
-        md += render_blocks(children, output_dir, page_id, current_dir, indent + 1, visited, depth, manifest, collected)
+        child_indent = indent if block_type in LAYOUT_CONTAINER_BLOCKS else indent + 1
+        md += render_blocks(children, output_dir, page_id, current_dir, child_indent, visited, depth, old_items, planned, force_rewrite_ids, collected, child_parent_dir)
 
     return md
 
@@ -615,7 +973,7 @@ def render_block(block, output_dir, page_id, current_dir, indent=0, visited=None
 # 页面同步核心逻辑
 # ============================================================
 
-def sync_page(page_id, output_dir, visited=None, depth=0, manifest=None):
+def sync_page(page_id, output_dir, visited=None, old_items=None, planned=None, force_rewrite_ids=None, depth=0):
     """
     递归同步一个 Notion 页面及其所有子页面
 
@@ -623,6 +981,9 @@ def sync_page(page_id, output_dir, visited=None, depth=0, manifest=None):
     """
     if visited is None:
         visited = set()
+    old_items = old_items or {}
+    planned = planned if planned is not None else {}
+    force_rewrite_ids = force_rewrite_ids or set()
 
     with VISITED_LOCK:
         if page_id in visited:
@@ -630,28 +991,27 @@ def sync_page(page_id, output_dir, visited=None, depth=0, manifest=None):
         visited.add(page_id)
 
     result = {}
+    entry = planned.get(page_id)
+    if not entry:
+        entry = planned_child_entry(page_id, "Untitled", "page", None, None, output_dir, planned, output_dir / "_orphans")
+
+    if can_reuse_entry(entry, old_items, force_rewrite_ids):
+        print(f"{'  ' * depth}⏭️  {entry['title']}（未修改）")
+        return {page_id: entry}
 
     # 获取页面信息
     page = notion_get(f"pages/{page_id}")
     if not page:
         return result
+    if is_notion_trashed(page):
+        print(f"{'  ' * depth}🚫 跳过回收站页面: {page_id}")
+        return result
 
-    title = get_page_title(page)
-    safe_title = sanitize_filename(title)
+    title = entry.get("title") or get_page_title(page)
+    filepath = Path(entry["file"])
+    child_dir = filepath.with_suffix("")
 
-    # 截断过长文件名
-    if len(safe_title) > 60:
-        safe_title = safe_title[:60]
-
-    # 用 page_id 作为文件名核心（避免重名冲突）
-    filename = f"{safe_title}_{page_id[:8]}.md"
-    filepath = output_dir / "pages" / filename
-
-    last_edited = page.get("last_edited_time", "")
-    old_info = unchanged_page_info(page_id, last_edited, manifest)
-    if old_info:
-        print(f"{'  ' * depth}⏭️  {title}（未修改）")
-        return {page_id: old_info}
+    last_edited = entry.get("last_edited") or page.get("last_edited_time", "")
 
     print(f"{'  ' * depth}📄 {title}")
 
@@ -686,43 +1046,52 @@ def sync_page(page_id, output_dir, visited=None, depth=0, manifest=None):
     blocks = get_block_children(page_id)
     if blocks:
         md_lines.append("\n")
-        md_lines.append(render_blocks(blocks, output_dir, page_id, filepath.parent, visited=visited, depth=depth, manifest=manifest, collected=result))
+        md_lines.append(render_blocks(blocks, output_dir, page_id, filepath.parent, visited=visited, depth=depth, old_items=old_items, planned=planned, force_rewrite_ids=force_rewrite_ids, collected=result, child_parent_dir=child_dir))
 
     # 写文件
     filepath.parent.mkdir(parents=True, exist_ok=True)
     with open(filepath, "w", encoding="utf-8") as f:
         f.writelines(md_lines)
 
-    result[page_id] = {
-        "file": str(filepath.resolve()),
+    entry.update({
         "title": title,
         "last_edited": last_edited,
-    }
+        "url": page.get("url", entry.get("url", "")),
+        "file": str(filepath.resolve()),
+        "path": markdown_path(os.path.relpath(str(filepath), str(output_dir))),
+    })
+    result[page_id] = entry
 
     return result
 
 
-def sync_database_row(row, db_title, db_dir, output_dir, depth=0, manifest=None):
+def sync_database_row(row, db_title, db_dir, output_dir, visited=None, old_items=None, planned=None, force_rewrite_ids=None, depth=0):
     """同步 database 中的一条记录。"""
     result = {}
     indent = "  " * depth
+    old_items = old_items or {}
+    planned = planned if planned is not None else {}
+    force_rewrite_ids = force_rewrite_ids or set()
+    visited = visited if visited is not None else set()
     row_id = row["id"]
+    if is_notion_trashed(row):
+        print(f"{indent}  🚫 跳过回收站条目: {row_id}")
+        return result
+
     row_title = get_page_title(row)
-    safe_row_title = sanitize_filename(row_title)
+    entry = planned.get(row_id)
+    if not entry:
+        parent_id = search_item_parent_id(row)
+        entry = planned_child_entry(row_id, row_title, "page", parent_id, "database_id", output_dir, planned, db_dir)
+    filepath = Path(entry["file"])
+    child_dir = filepath.with_suffix("")
 
-    if len(safe_row_title) > 50:
-        safe_row_title = safe_row_title[:50]
-
-    filename = f"{safe_row_title}_{row_id[:8]}.md"
-    filepath = db_dir / filename
-
-    old_info = unchanged_page_info(row_id, row.get("last_edited_time", ""), manifest)
-    if old_info:
-        print(f"{indent}  ⏭️  {row_title}（未修改）")
-        return {row_id: old_info}
+    if can_reuse_entry(entry, old_items, force_rewrite_ids):
+        print(f"{indent}  ⏭️  {entry['title']}（未修改）")
+        return {row_id: entry}
 
     md_lines = []
-    last_edited = row.get("last_edited_time", "")
+    last_edited = entry.get("last_edited") or row.get("last_edited_time", "")
     created = row.get("created_time", "")
     url = row.get("url", "")
 
@@ -801,35 +1170,51 @@ def sync_database_row(row, db_title, db_dir, output_dir, depth=0, manifest=None)
     blocks = get_block_children(row_id)
     if blocks:
         md_lines.append("\n## 内容\n\n")
-        md_lines.append(render_blocks(blocks, output_dir, row_id, db_dir, visited=set(), depth=depth, manifest=manifest, collected=result))
+        md_lines.append(render_blocks(blocks, output_dir, row_id, db_dir, visited=visited, depth=depth, old_items=old_items, planned=planned, force_rewrite_ids=force_rewrite_ids, collected=result, child_parent_dir=child_dir))
 
+    filepath.parent.mkdir(parents=True, exist_ok=True)
     with open(filepath, "w", encoding="utf-8") as f:
         f.writelines(md_lines)
 
-    result[row_id] = {
-        "file": str(filepath.resolve()),
+    entry.update({
         "title": row_title,
         "last_edited": last_edited,
-    }
+        "url": row.get("url", entry.get("url", "")),
+        "file": str(filepath.resolve()),
+        "path": markdown_path(os.path.relpath(str(filepath), str(output_dir))),
+    })
+    result[row_id] = entry
 
     return result
 
 
-def sync_database(db_id, output_dir, depth=0, manifest=None):
+def sync_database(db_id, output_dir, visited=None, old_items=None, planned=None, force_rewrite_ids=None, depth=0):
     """
     同步一个 Database 中的所有条目为独立的 Markdown 文件
     """
     result = {}
     indent = "  " * depth
+    old_items = old_items or {}
+    planned = planned if planned is not None else {}
+    force_rewrite_ids = force_rewrite_ids or set()
+    visited = visited if visited is not None else set()
 
-    # 获取 Database 信息
-    db = notion_get(f"databases/{db_id}")
-    if not db:
-        return result
+    with VISITED_LOCK:
+        if db_id in visited:
+            return {}
+        visited.add(db_id)
 
-    db_title = get_database_title(db)
-    safe_db_title = sanitize_filename(db_title)
-    db_dir = output_dir / "databases" / f"{safe_db_title}_{db_id[:8]}"
+    entry = planned.get(db_id)
+    if not entry:
+        db = notion_get(f"databases/{db_id}")
+        if not db or is_notion_trashed(db):
+            return result
+        db_title = get_database_title(db)
+        entry = planned_child_entry(db_id, db_title, "database", None, None, output_dir, planned, output_dir / "_orphans")
+        entry["last_edited"] = db.get("last_edited_time", "")
+        entry["url"] = db.get("url", "")
+    db_title = entry["title"]
+    db_dir = Path(entry["file"])
     db_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"{indent}🗄️  Database: {db_title}")
@@ -852,7 +1237,7 @@ def sync_database(db_id, output_dir, depth=0, manifest=None):
             workers = max(1, min(MAX_WORKERS, len(rows)))
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = [
-                    executor.submit(sync_database_row, row, db_title, db_dir, output_dir, depth, manifest)
+                    executor.submit(sync_database_row, row, db_title, db_dir, output_dir, visited, old_items, planned, force_rewrite_ids, depth)
                     for row in rows
                 ]
                 for future in as_completed(futures):
@@ -864,25 +1249,47 @@ def sync_database(db_id, output_dir, depth=0, manifest=None):
         has_more = data.get("has_more", False)
         start_cursor = data.get("next_cursor")
 
+    result[db_id] = entry
+
     return result
 
 
-def sync_search_item(item, output_dir, visited, manifest=None):
+def sync_search_item(item, output_dir, visited, old_items=None, planned=None, force_rewrite_ids=None):
     """同步 search 返回的一个页面或数据库。"""
     obj_type = item.get("object", "")
     obj_id = item["id"]
 
     if obj_type == "page":
-        return sync_page(obj_id, output_dir, visited, manifest=manifest)
+        return sync_page(obj_id, output_dir, visited, old_items, planned, force_rewrite_ids)
 
     if obj_type == "database":
-        result = sync_database(obj_id, output_dir, manifest=manifest)
+        result = sync_database(obj_id, output_dir, visited, old_items, planned, force_rewrite_ids)
         with VISITED_LOCK:
             for rid in result:
                 visited.add(rid)
         return result
 
     return {}
+
+
+def search_item_parent_id(item):
+    """从 Notion search 结果中提取父对象 ID。"""
+    parent = item.get("parent") or {}
+    parent_type = parent.get("type")
+    if not parent_type:
+        return None
+    return parent.get(parent_type)
+
+
+def is_nested_search_item(item, search_ids):
+    """判断 search 结果是否已经会被父页面或父数据库递归同步。"""
+    parent = item.get("parent") or {}
+    parent_type = parent.get("type")
+    if parent_type in ("page_id", "database_id"):
+        return True
+
+    parent_id = search_item_parent_id(item)
+    return bool(parent_id and parent_id in search_ids)
 
 
 def get_index_page(output_dir, all_pages):
@@ -953,7 +1360,7 @@ def main():
 
     output_dir = Path(OUTPUT_DIR).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    manifest = load_manifest(output_dir)
+    old_items = load_sync_manifest(output_dir)
 
     print("🚀 开始同步 Notion 工作区...")
     print(f"📂 输出目录: {output_dir.resolve()}")
@@ -963,33 +1370,71 @@ def main():
     # 搜索所有页面
     print("🔍 搜索工作区页面...")
     all_pages_data = get_all_pages()
-    print(f"✅ 搜索到 {len(all_pages_data)} 个页面/数据库\n")
+    trashed_count = sum(1 for item in all_pages_data if is_notion_trashed(item))
+    all_pages_data = [
+        item for item in all_pages_data
+        if not is_notion_trashed(item)
+    ]
+    if trashed_count:
+        print(f"🚫 已过滤 {trashed_count} 个回收站/归档对象")
+    print(f"✅ 搜索到 {len(all_pages_data)} 个可同步页面/数据库\n")
 
-    # 不再区分顶级/非顶级，搜到什么就同步什么
-    # 用全局 visited 避免同一条目被搜到又递归到
+    planned = build_path_plan(output_dir, all_pages_data)
+    force_rewrite_ids = changed_or_moved_ids(planned, old_items)
+    print(f"🧭 路径规划: {len(planned)} 个对象，需刷新: {len(force_rewrite_ids)}")
+
     all_results = {}
     visited = set()
+    planned_databases = {
+        obj_id for obj_id, entry in planned.items()
+        if entry.get("object_type") == "database"
+    }
+    sync_items = [
+        item for item in all_pages_data
+        if item.get("object") == "database"
+        or (
+            item.get("parent", {}).get("type") == "page_id"
+            and search_item_parent_id(item) not in planned
+        )
+        or (
+            item.get("parent", {}).get("type") == "database_id"
+            and search_item_parent_id(item) not in planned_databases
+        )
+        or item.get("parent", {}).get("type") not in ("page_id", "database_id")
+    ]
 
-    workers = max(1, min(MAX_WORKERS, len(all_pages_data) or 1))
+    print(f"🌳 本次调度: {len(sync_items)} 个入口对象")
+
+    workers = max(1, min(MAX_WORKERS, len(sync_items) or 1))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = [
-            executor.submit(sync_search_item, item, output_dir, visited, manifest)
-            for item in all_pages_data
+            executor.submit(sync_search_item, item, output_dir, visited, old_items, planned, force_rewrite_ids)
+            for item in sync_items
         ]
         for future in as_completed(futures):
             try:
-                all_results.update(future.result())
+                result = future.result()
+                all_results.update(result)
+                with VISITED_LOCK:
+                    visited.update(result.keys())
             except Exception as e:
                 print(f"  ⚠️ 同步任务失败: {e}")
 
+    current_items = {
+        obj_id: entry
+        for obj_id, entry in planned.items()
+        if obj_id in all_results or can_reuse_entry(entry, old_items, force_rewrite_ids)
+    }
+    archive_stale_entries(output_dir, old_items, current_items)
+    save_sync_manifest(output_dir, current_items)
+
     print(f"\n{'=' * 40}")
     print(f"✅ 同步完成!")
-    print(f"📄 页面/条目: {len(all_results)}")
+    print(f"📄 页面/条目: {len(current_items)}")
     print(f"📁 输出目录: {output_dir.resolve()}")
 
     # 生成索引
-    get_index_page(output_dir, all_results)
-    save_manifest(output_dir, all_results)
+    get_index_page(output_dir, current_items)
 
 
 if __name__ == "__main__":

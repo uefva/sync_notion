@@ -5,4 +5,5 @@ conf/config.json
 notion_sync/
 sync.log
 .sync_state.json
+.sync_manifest.json
 .idea
