@@ -682,8 +682,11 @@ def planned_child_entry(obj_id, title, object_type, parent_id, parent_type, outp
 def relayout_planned_child(obj_id, title, object_type, parent_id, parent_type, output_dir, planned, parent_dir):
     """用递归上下文修正 search 阶段无法定位的子对象路径。"""
     entry = planned.get(obj_id)
-    if entry and "_orphans/" not in entry.get("path", ""):
-        return entry
+    if entry:
+        entry_path = Path(entry.get("file", "")).resolve() if entry.get("file") else None
+        parent_path = Path(parent_dir).resolve()
+        if entry_path and "_orphans/" not in entry.get("path", "") and path_is_relative_to(entry_path, parent_path):
+            return entry
 
     if entry:
         old_file = entry.get("file")
@@ -1079,10 +1082,8 @@ def sync_database_row(row, db_title, db_dir, output_dir, visited=None, old_items
         return result
 
     row_title = get_page_title(row)
-    entry = planned.get(row_id)
-    if not entry:
-        parent_id = search_item_parent_id(row)
-        entry = planned_child_entry(row_id, row_title, "page", parent_id, "database_id", output_dir, planned, db_dir)
+    parent_id = search_item_parent_id(row)
+    entry = relayout_planned_child(row_id, row_title, "page", parent_id, "database_id", output_dir, planned, db_dir)
     filepath = Path(entry["file"])
     child_dir = filepath.with_suffix("")
 
