@@ -58,6 +58,9 @@ MAX_WORKERS = 4
 # 是否将图片下载到本地（否则只保留外链）
 DOWNLOAD_IMAGES = True
 
+# 图片下载失败后的重试次数
+IMAGE_DOWNLOAD_RETRIES = 2
+
 # Notion API 版本
 NOTION_VERSION = "2022-06-28"
 
@@ -267,8 +270,17 @@ def get_block_children(block_id, cursor=None):
 # 图片下载
 # ============================================================
 
+def is_downloadable_image_url(url):
+    """只下载完整 HTTP(S) 图片链接；相对路径保留原链接。"""
+    parsed = urlparse(url or "")
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
 def download_image(url, output_dir, page_id, block_id):
     """下载图片到本地 pages/images/ 目录，返回相对路径"""
+    if not is_downloadable_image_url(url):
+        return None
+
     images_dir = output_dir / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
 
@@ -286,15 +298,26 @@ def download_image(url, output_dir, page_id, block_id):
     if filepath.exists():
         return filepath
 
-    try:
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        with open(filepath, "wb") as f:
-            f.write(resp.content)
-        return filepath
-    except Exception as e:
-        print(f"  ⚠️ 图片下载失败 ({url[:60]}...): {e}")
-        return None
+    last_error = None
+    attempts = max(1, int(IMAGE_DOWNLOAD_RETRIES) + 1)
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    }
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            with open(filepath, "wb") as f:
+                f.write(resp.content)
+            return filepath
+        except Exception as e:
+            last_error = e
+            if attempt < attempts:
+                time.sleep(min(2 * attempt, 5))
+
+    print(f"  ⚠️ 图片下载失败，保留原链接 ({url[:60]}...): {last_error}")
+    return None
 
 
 # ============================================================
@@ -1324,7 +1347,7 @@ def get_index_page(output_dir, all_pages):
 # ============================================================
 
 def main():
-    global NOTION_TOKEN, OUTPUT_DIR, REQUEST_DELAY, REQUEST_TIMEOUT, MAX_WORKERS, DOWNLOAD_IMAGES
+    global NOTION_TOKEN, OUTPUT_DIR, REQUEST_DELAY, REQUEST_TIMEOUT, MAX_WORKERS, DOWNLOAD_IMAGES, IMAGE_DOWNLOAD_RETRIES
 
     config = load_config()
 
@@ -1334,6 +1357,7 @@ def main():
     REQUEST_TIMEOUT = float(config.get("request_timeout", REQUEST_TIMEOUT))
     MAX_WORKERS = int(config.get("max_workers", MAX_WORKERS))
     DOWNLOAD_IMAGES = bool(config.get("download_images", DOWNLOAD_IMAGES))
+    IMAGE_DOWNLOAD_RETRIES = int(config.get("image_download_retries", IMAGE_DOWNLOAD_RETRIES))
 
     parser = argparse.ArgumentParser(description="Notion → 本地 Markdown 同步")
     parser.add_argument("--output", default=OUTPUT_DIR, help="输出目录")

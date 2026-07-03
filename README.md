@@ -52,7 +52,8 @@ cp conf/config.example.json conf/config.json
   "request_delay": 0.1,
   "request_timeout": 30,
   "max_workers": 4,
-  "download_images": true
+  "download_images": true,
+  "image_download_retries": 2
 }
 ```
 
@@ -66,6 +67,7 @@ cp conf/config.example.json conf/config.json
 | `request_timeout` | 请求超时，单位秒 |
 | `max_workers` | 并发任务数量 |
 | `download_images` | 是否下载图片到本地 |
+| `image_download_retries` | 图片下载失败后的重试次数 |
 
 `conf/config.json` 包含私密 Token，已经被 `.gitignore` 忽略。发布到 GitHub 时只提交 `conf/config.example.json`。
 
@@ -202,7 +204,7 @@ tail -f /home/software/notion_sync/sync.log
 
 这通常来自从 Word、Markdown 或网页导入到 Notion 的内容。图片地址是相对路径，不是完整的 `https://...` 链接，因此无法通过网络下载。
 
-脚本会保留页面同步流程，不会因为单张图片失败而中断。
+脚本会保留原始图片链接，不会因为单张图片失败而中断。完整的 `http://` 或 `https://` 图片会按 `image_download_retries` 配置重试；如果仍然失败，也会保留外链继续同步。
 
 ### 429: 触发限频
 

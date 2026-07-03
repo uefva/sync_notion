@@ -4,5 +4,6 @@
   "request_delay": 0.1,
   "request_timeout": 30,
   "max_workers": 4,
-  "download_images": true
+  "download_images": true,
+  "image_download_retries": 2
 }
