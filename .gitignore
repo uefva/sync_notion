@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+
+conf/config.json
+notion_sync/
+sync.log
+.sync_state.json
+.idea

@@ -1,0 +1,8 @@
+{
+  "notion_token": "ntn_你的Token",
+  "output_dir": "./notion_sync",
+  "request_delay": 0.1,
+  "request_timeout": 30,
+  "max_workers": 4,
+  "download_images": true
+}
