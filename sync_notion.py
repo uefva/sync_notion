@@ -18,6 +18,7 @@ import time
 import argparse
 import threading
 import shutil
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from datetime import datetime
@@ -98,6 +99,40 @@ LAYOUT_CONTAINER_BLOCKS = {
     "template",
     "link_preview",
 }
+
+CJK_PUNCTUATION_TRANSLATION = str.maketrans({
+    "。": ".",
+    "．": ".",
+    "，": ",",
+    "、": ",",
+    "；": ";",
+    "：": ":",
+    "！": "!",
+    "？": "?",
+    "（": "(",
+    "）": ")",
+    "【": "[",
+    "】": "]",
+    "［": "[",
+    "］": "]",
+    "｛": "{",
+    "｝": "}",
+    "《": "[",
+    "》": "]",
+    "〈": "[",
+    "〉": "]",
+    "「": "'",
+    "」": "'",
+    "『": "'",
+    "』": "'",
+    "“": "'",
+    "”": "'",
+    "‘": "'",
+    "’": "'",
+    "—": "-",
+    "–": "-",
+    "…": "...",
+})
 
 
 def update_headers():
@@ -500,9 +535,12 @@ def block_to_md(block, indent=0, output_dir=None, page_id="", current_dir=None):
 
 
 def sanitize_filename(name):
-    """清理非法文件名字符"""
+    """清理非法文件名字符，并统一空白和中文标点。"""
     invalid_chars = '<>:"/\\|?*'
+    name = unicodedata.normalize("NFKC", str(name or ""))
     name = normalize_text_whitespace(name)
+    name = name.translate(CJK_PUNCTUATION_TRANSLATION)
+    name = re.sub(r"\s+", "_", name)
     result = "".join(c if c not in invalid_chars else "_" for c in name)
     result = result.strip(". ")
     return result or "untitled"
@@ -523,7 +561,7 @@ def reserve_unique_path(base_path, entity_id=None, manifest=None):
             if index == 1:
                 candidate = base_path
             else:
-                candidate = base_path.with_name(f"{base_path.stem} ({index}){base_path.suffix}")
+                candidate = base_path.with_name(f"{base_path.stem}_{index}{base_path.suffix}")
 
             resolved = str(candidate.resolve())
             if resolved not in RESERVED_PATHS:
@@ -531,6 +569,14 @@ def reserve_unique_path(base_path, entity_id=None, manifest=None):
                 return candidate
 
             index += 1
+
+
+def database_content_dir(database_entry):
+    """返回数据库条目 Markdown 文件对应的内容目录。"""
+    db_path = Path(database_entry["file"])
+    if db_path.suffix.lower() == ".md":
+        return db_path.with_suffix("")
+    return db_path
 
 
 def load_sync_manifest(output_dir):
@@ -745,11 +791,11 @@ def build_path_plan(output_dir, search_items):
             if parent_type == "page_id" and parent_id in item_map:
                 parent_entry = planned_entry(parent_id)
                 parent_dir = Path(parent_entry["file"]).with_suffix("") if parent_entry else output_dir / "_orphans"
-                base_path = parent_dir / safe_title
+                base_path = parent_dir / f"{safe_title}.md"
             elif parent_type == "workspace":
-                base_path = output_dir / "databases" / safe_title
+                base_path = output_dir / "databases" / f"{safe_title}.md"
             else:
-                base_path = output_dir / "_orphans" / safe_title
+                base_path = output_dir / "_orphans" / f"{safe_title}.md"
             target_path = reserve_unique_path(base_path)
         else:
             max_length = 50 if parent_type == "database_id" else 60
@@ -760,7 +806,7 @@ def build_path_plan(output_dir, search_items):
                 base_path = parent_dir / f"{safe_title}.md"
             elif parent_type == "database_id" and parent_id in item_map:
                 parent_entry = planned_entry(parent_id)
-                parent_dir = Path(parent_entry["file"]) if parent_entry else output_dir / "_orphans"
+                parent_dir = database_content_dir(parent_entry) if parent_entry else output_dir / "_orphans"
                 base_path = parent_dir / f"{safe_title}.md"
             elif parent_type == "workspace":
                 base_path = output_dir / "pages" / f"{safe_title}.md"
@@ -802,7 +848,7 @@ def planned_child_entry(obj_id, title, object_type, parent_id, parent_type, outp
     now = datetime.now().isoformat(timespec="seconds")
     if object_type == "database":
         safe_title = truncate_filename(sanitize_filename(title), 60)
-        target_path = reserve_unique_path(Path(parent_dir) / safe_title)
+        target_path = reserve_unique_path(Path(parent_dir) / f"{safe_title}.md")
     else:
         max_length = 50 if parent_type == "database_id" else 60
         safe_title = truncate_filename(sanitize_filename(title), max_length)
@@ -843,7 +889,7 @@ def relayout_planned_child(obj_id, title, object_type, parent_id, parent_type, o
     now = datetime.now().isoformat(timespec="seconds")
     if object_type == "database":
         safe_title = truncate_filename(sanitize_filename(entry.get("title") or title), 60)
-        target_path = reserve_unique_path(Path(parent_dir) / safe_title)
+        target_path = reserve_unique_path(Path(parent_dir) / f"{safe_title}.md")
     else:
         max_length = 50 if parent_type == "database_id" else 60
         safe_title = truncate_filename(sanitize_filename(entry.get("title") or title), max_length)
@@ -1334,6 +1380,41 @@ def sync_database_row(row, db_title, db_dir, output_dir, visited=None, old_items
     return result
 
 
+def write_database_index(filepath, entry, row_entries, output_dir):
+    """为数据库目录生成一个同名 Markdown 入口文件。"""
+    filepath = Path(filepath)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+
+    title = entry.get("title") or "Untitled"
+    md_lines = []
+    md_lines.append("---\n")
+    md_lines.append(f"title: {yaml_value(title)}\n")
+    md_lines.append("type: database\n")
+    md_lines.append(f"notion_id: {yaml_value(entry.get('id', ''))}\n")
+    md_lines.append(f"last_edited: {yaml_value(entry.get('last_edited', ''))}\n")
+    md_lines.append(f"url: {yaml_value(entry.get('url', ''))}\n")
+    md_lines.append("---\n\n")
+
+    md_lines.append(f"# {title}\n\n")
+    md_lines.append("## 条目\n\n")
+
+    rows = [row for row in row_entries if row and row.get("file")]
+    if rows:
+        for row in rows:
+            link = relative_markdown_link(row["file"], filepath.parent)
+            md_lines.append(f"- [{row.get('title') or 'Untitled'}]({link})\n")
+    else:
+        md_lines.append("_暂无条目_\n")
+
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.writelines(md_lines)
+
+    entry.update({
+        "file": str(filepath.resolve()),
+        "path": markdown_path(os.path.relpath(str(filepath), str(output_dir))),
+    })
+
+
 def sync_database(db_id, output_dir, visited=None, old_items=None, planned=None, force_rewrite_ids=None, depth=0):
     """
     同步一个 Database 中的所有条目为独立的 Markdown 文件
@@ -1360,7 +1441,8 @@ def sync_database(db_id, output_dir, visited=None, old_items=None, planned=None,
         entry["last_edited"] = db.get("last_edited_time", "")
         entry["url"] = db.get("url", "")
     db_title = entry["title"]
-    db_dir = Path(entry["file"])
+    db_file = Path(entry["file"])
+    db_dir = database_content_dir(entry)
     db_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"{indent}🗄️  Database: {db_title}")
@@ -1368,6 +1450,7 @@ def sync_database(db_id, output_dir, visited=None, old_items=None, planned=None,
     # 查询所有条目
     has_more = True
     start_cursor = None
+    row_entries = []
 
     while has_more:
         body = {"page_size": 100}
@@ -1382,19 +1465,40 @@ def sync_database(db_id, output_dir, visited=None, old_items=None, planned=None,
         if rows:
             workers = max(1, min(MAX_WORKERS, len(rows)))
             with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = [
-                    executor.submit(sync_database_row, row, db_title, db_dir, output_dir, visited, old_items, planned, force_rewrite_ids, depth)
+                futures = {
+                    executor.submit(
+                        sync_database_row,
+                        row,
+                        db_title,
+                        db_dir,
+                        output_dir,
+                        visited,
+                        old_items,
+                        planned,
+                        force_rewrite_ids,
+                        depth,
+                    ): row["id"]
                     for row in rows
-                ]
+                }
+                synced_rows = {}
                 for future in as_completed(futures):
+                    row_id = futures[future]
                     try:
-                        result.update(future.result())
+                        row_result = future.result()
+                        result.update(row_result)
+                        if row_id in row_result:
+                            synced_rows[row_id] = row_result[row_id]
                     except Exception as e:
                         print(f"{indent}  ⚠️ 数据库条目同步失败: {e}")
+                for row in rows:
+                    row_entry = synced_rows.get(row["id"]) or planned.get(row["id"])
+                    if row_entry:
+                        row_entries.append(row_entry)
 
         has_more = data.get("has_more", False)
         start_cursor = data.get("next_cursor")
 
+    write_database_index(db_file, entry, row_entries, output_dir)
     result[db_id] = entry
 
     return result
