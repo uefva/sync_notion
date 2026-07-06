@@ -28,7 +28,7 @@ try:
     import requests
 except ImportError:
     print("请先安装 requests: pip install requests")
-    exit(1)
+    sys.exit(1)
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -39,7 +39,7 @@ if hasattr(sys.stderr, "reconfigure"):
 # ★ 配置区域 ★
 # ============================================================
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+SCRIPT_DIR = Path(os.getcwd())
 CONFIG_FILE = SCRIPT_DIR / "conf" / "config.json"
 
 # 默认配置，可在 conf/config.json 中覆盖
@@ -202,7 +202,7 @@ def notion_get(path, params=None):
         print("❌ Token 无效或没有权限。检查你的 Integration Token。")
         print("   注意：你需要把 Integration 分享到你的工作区顶级页面。")
         print("   参考第二步：页面 ··· → Add connections → 选你的 Integration")
-        exit(1)
+        sys.exit(1)
     if resp.status_code == 404:
         # 可能是页面被删除或无权访问
         print(f"  ⚠️ 404: {url} （跳过）")
@@ -231,7 +231,7 @@ def notion_post(path, body=None):
         print("❌ Token 无效或没有权限。检查你的 Integration Token。")
         print("   注意：你需要把 Integration 分享到你的工作区顶级页面。")
         print("   参考第二步：页面 ··· → Add connections → 选你的 Integration")
-        exit(1)
+        sys.exit(1)
     if resp.status_code == 404:
         print(f"  ⚠️ 404: {url} （跳过）")
         return None
@@ -1688,7 +1688,7 @@ def main():
         print()
         print("  获取 Token: https://www.notion.so/my-integrations")
         print("=" * 60)
-        exit(1)
+        sys.exit(1)
 
     output_dir = Path(OUTPUT_DIR).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
