@@ -7,3 +7,6 @@ sync.log
 .sync_state.json
 .sync_manifest.json
 .idea
+dist
+build
+*.spec
