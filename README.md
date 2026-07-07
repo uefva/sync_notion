@@ -1,5 +1,7 @@
 # Notion Sync
 
+[English](README_EN.md)
+
 把 Notion 工作区内容同步到本地 Markdown 文件，适合用来做个人知识库备份、Git 版本管理、静态站点内容源或离线检索。
 
 ## 功能特性
