@@ -2,19 +2,17 @@
 
 [中文](README.md)
 
-Sync Notion workspace content to local Markdown files. Ideal for personal knowledge base backups, Git version control, static site content sources, or offline search.
+Sync Notion workspace content to local Markdown files while preserving the same note structure as in Notion. Ideal for personal knowledge base backups, Git version control, static site content sources, or offline search.
 
 ## Features
 
 - Sync Notion pages as Markdown files
-- Sync Notion Databases as an entry Markdown file with database entries exported as individual Markdown files in a same-named subdirectory
-- Recursive export of sub-pages, nested blocks, toggles, tables, code blocks, quotes, to-dos, images, and other common content types
+- Support exporting sub-pages, nested blocks, toggles, tables, code blocks, quotes, to-dos, images, and other common content types
 - Download images to a local `images/` directory
 - Mirror-style incremental sync using `.sync_manifest.json` — unchanged pages reuse local Markdown files
 - Refreshes `index.md` with the latest mirror index on every run
 - Automatically skips archived or trashed pages, databases, and database entries
-- Content that existed in the previous manifest but no longer appears in Notion is moved to `_stale/` rather than being deleted outright
-- Automatic filename sanitization: whitespace replaced with `_`, common CJK/fullwidth punctuation converted to ASCII equivalents
+- Automatically sanitizes filenames: whitespace replaced with `_`, common CJK/fullwidth punctuation converted to English punctuation
 - Concurrent sync support with adjustable `--workers`
 - Auto-generates `index.md` index file
 - Gracefully skips objects with insufficient permissions, deleted items, or unsupported API objects without interrupting the overall sync
@@ -86,6 +84,16 @@ Configuration fields:
 To sync your entire workspace, add the Integration to the top-level page you want to use as the root. Notion permissions are hierarchical — pages or databases without explicit authorization cannot be read via the API.
 
 ## Usage
+
+#### Start syncing:
+
+![image-20260711160432073](E:\MyPriveCloud\mySoftware\sync_notion\README\image-20260711160432073.png)
+
+#### Sync complete:
+
+The tool automatically detects and skips notes that are identical to the local copies. Notes deleted in Notion are archived to a separate local folder.
+
+![image-20260711160545215](E:\MyPriveCloud\mySoftware\sync_notion\README\image-20260711160545215.png)
 
 Basic usage:
 

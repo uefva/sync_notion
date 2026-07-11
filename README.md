@@ -2,18 +2,16 @@
 
 [English](README_EN.md)
 
-把 Notion 工作区内容同步到本地 Markdown 文件，适合用来做个人知识库备份、Git 版本管理、静态站点内容源或离线检索。
+把Notion工作区内容同步到本地Markdown文件，保留与Notion相同的笔记结构，适合用来做个人知识库备份、Git 版本管理、静态站点内容源或离线检索。
 
 ## 功能特性
 
 - 同步 Notion 页面为 Markdown 文件
-- 同步 Notion Database 为同名入口 Markdown，并将数据库条目导出为同名目录下的独立 Markdown 文件
-- 支持递归导出子页面、嵌套块、Toggle、表格、代码块、引用、待办、图片等常见内容
+- 支持导出子页面、嵌套块、Toggle、表格、代码块、引用、待办、图片等常见内容
 - 支持图片下载到本地 `images/` 目录
 - 使用 `.sync_manifest.json` 做镜像式增量同步，未变化页面会复用本地 Markdown
 - 每次运行都会刷新 `index.md` 为最新镜像索引
 - 自动跳过 Notion 已归档或回收站中的页面、数据库和数据库条目
-- 旧清单中存在但本次 Notion 不再出现的内容会移动到 `_stale/`，不会直接删除
 - 自动规范化文件名：空白字符会替换为 `_`，常见中文/全角标点会转换为英文标点或安全字符
 - 支持并发同步，可通过 `--workers` 调整速度
 - 自动生成 `index.md` 索引文件
@@ -86,6 +84,20 @@ cp conf/config.example.json conf/config.json
 如果要同步整个工作区，建议把 Integration 添加到你希望作为根目录的顶级页面上。Notion 的权限是逐层控制的，没有授权的页面或数据库无法通过 API 读取。
 
 ## 使用方法
+
+#### 开始同步：
+
+![image-20260711160432073](E:\MyPriveCloud\mySoftware\sync_notion\README\image-20260711160432073.png)
+
+
+
+#### 同步结束：
+
+会自动检测Notion与本地相同的笔记并跳过，Notion已删除的则会自动归档到本地单独的文件夹内
+
+![image-20260711160545215](E:\MyPriveCloud\mySoftware\sync_notion\README\image-20260711160545215.png)
+
+
 
 基础运行：
 
@@ -245,13 +257,3 @@ Notion API 有请求频率限制。出现 429 时脚本会等待后重试。
 ```bash
 python sync_notion.py --workers 2 --delay 0.2
 ```
-
-## 安全提醒
-
-不要把真实 Notion Token 提交到 GitHub。仓库里应该只提交 `conf/config.example.json`，不要提交本地的 `conf/config.json`。
-
-如果 Token 已经提交到公开仓库，请立即到 Notion Integration 后台重新生成 Token。
-
-## License
-
-MIT
