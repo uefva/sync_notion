@@ -87,7 +87,7 @@ cp conf/config.example.json conf/config.json
 
 #### 开始同步：
 
-![image-20260711160432073](E:\MyPriveCloud\mySoftware\sync_notion\README\image-20260711160432073.png)
+![image-20260711160432073](./README/image-20260711160432073.png)
 
 
 
@@ -95,7 +95,7 @@ cp conf/config.example.json conf/config.json
 
 会自动检测Notion与本地相同的笔记并跳过，Notion已删除的则会自动归档到本地单独的文件夹内
 
-![image-20260711160545215](E:\MyPriveCloud\mySoftware\sync_notion\README\image-20260711160545215.png)
+![image-20260711160545215](./README/image-20260711160545215.png)
 
 
 
